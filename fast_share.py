@@ -1,12 +1,11 @@
 import asyncio
-import http.server
-import socketserver
 import threading
 import mss
-import cv2  # Requires: pip install opencv-python
+import cv2  # Requires: pip install opencv-python aiohttp
 import numpy as np
+from aiohttp import web
 
-# Combined HTML & JavaScript using WebSocket for instant frame rendering
+# Combined HTML & JavaScript using relative WebSocket paths
 HTML_PAGE = """
 <!DOCTYPE html>
 <html>
@@ -31,7 +30,9 @@ HTML_PAGE = """
             frameCount = 0;
         }, 1000);
 
-        const ws = new WebSocket(`ws://${window.location.hostname}:8002`);
+        // Dynamically match protocol and port automatically
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws`);
         ws.binaryType = 'blob';
 
         ws.onmessage = (event) => {
@@ -48,8 +49,6 @@ HTML_PAGE = """
 </html>
 """
 
-import websockets
-
 current_frame = b""
 frame_lock = threading.Lock()
 
@@ -58,70 +57,59 @@ def capture_loop():
     global current_frame
     with mss.MSS() as sct:
         monitor = sct.monitors[1]
-        
-        # Optimize compression quality (80 is a good sweet spot for speed vs quality)
         encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 80]
         
         while True:
-            # 1. Grab raw pixels from screen (blazing fast)
             sct_img = sct.grab(monitor)
-            
-            # 2. Convert to numpy array directly without extra copy operations
             img_np = np.frombuffer(sct_img.bgra, dtype=np.uint8).reshape(sct_img.height, sct_img.width, 4)
-            
-            # 3. Convert to BGR (OpenCV format)
             img_bgr = cv2.cvtColor(img_np, cv2.COLOR_BGRA2BGR)
-            
-            # 4. Compress to JPEG (Significantly faster than PNG)
             result, img_bytes = cv2.imencode('.jpg', img_bgr, encode_param)
             
             if result:
                 with frame_lock:
                     current_frame = img_bytes.tobytes()
 
-async def stream_handler(websocket):
-    """Pushes the newest captured frame down the WebSocket pipeline."""
+async def handle_index(request):
+    """Serves the main web page."""
+    return web.Response(text=HTML_PAGE, content_type='text/html')
+
+async def handle_websocket(request):
+    """Pushes frames over the WebSocket protocol using a single port."""
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    
     global current_frame
     last_sent = b""
+    
     try:
-        while True:
+        while not ws.closed:
             with frame_lock:
                 frame_to_send = current_frame
             
-            # Only send if the frame has changed and isn't empty
             if frame_to_send and frame_to_send != last_sent:
-                await websocket.send(frame_to_send)
+                await ws.send_bytes(frame_to_send)
                 last_sent = frame_to_send
-            
-            # Yield control back to the event loop immediately 
-            await asyncio.sleep(0.001) 
-    except websockets.exceptions.ConnectionClosed:
+                
+            await asyncio.sleep(0.005) # Slightly relaxed to prevent CPU starvation
+    except Exception:
         pass
+    return ws
 
-class HTTPHandler(http.server.SimpleHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/html")
-        self.end_headers()
-        self.wfile.write(HTML_PAGE.encode("utf-8"))
-
-def start_http_server():
-    socketserver.TCPServer.allow_reuse_address = True
-    with socketserver.TCPServer(("0.0.0.0", 8000), HTTPHandler) as httpd:
-        httpd.serve_forever()
-
-async def main():
+def main():
+    # Dependencies required: pip install aiohttp opencv-python mss numpy
     threading.Thread(target=capture_loop, daemon=True).start()
-    threading.Thread(target=start_http_server, daemon=True).start()
     
-    print("High-performance streaming engine initialized.")
-    print("Open http://localhost:8000 to view your screen.")
+    app = web.Application()
+    app.add_routes([
+        web.get('/', handle_index),
+        web.get('/ws', handle_websocket)
+    ])
     
-    async with websockets.serve(stream_handler, "0.0.0.0", 8002):
-        await asyncio.get_running_loop().create_future()
+    print("Streaming engine running. Access it via your Tailscale IP on port 8000.")
+    web.run_app(app, host="0.0.0.0", port=8000)
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        main()
     except KeyboardInterrupt:
         print("\nStreaming halted.")
